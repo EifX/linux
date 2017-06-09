@@ -139,6 +139,11 @@
 
 #include <trace/events/sock.h>
 
+#ifdef CONFIG_MPTCP
+#include <net/mptcp.h>
+#include <net/inet_common.h>
+#endif
+
 #include <net/tcp.h>
 #include <net/busy_poll.h>
 
@@ -1370,6 +1375,23 @@ lenout:
  */
 static inline void sock_lock_init(struct sock *sk)
 {
+#ifdef CONFIG_MPTCP
+	/* Reclassify the lock-class for subflows */
+	if (sk->sk_type == SOCK_STREAM && sk->sk_protocol == IPPROTO_TCP)
+		if (mptcp(tcp_sk(sk)) || tcp_sk(sk)->is_master_sk) {
+			sock_lock_init_class_and_name(sk, meta_slock_key_name,
+						      &meta_slock_key,
+						      meta_key_name,
+						      &meta_key);
+
+			/* We don't yet have the mptcp-point.
+			 * Thus we still need inet_sock_destruct
+			 */
+			sk->sk_destruct = inet_sock_destruct;
+			return;
+		}
+#endif
+
 	if (sk->sk_kern_sock)
 		sock_lock_init_class_and_name(
 			sk,
@@ -1635,6 +1657,7 @@ struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
 		newsk->sk_userlocks	= sk->sk_userlocks & ~SOCK_BINDPORT_LOCK;
 
 		sock_reset_flag(newsk, SOCK_DONE);
+		sock_reset_flag(newsk, SOCK_MPTCP);
 
 		filter = rcu_dereference_protected(newsk->sk_filter, 1);
 		if (filter != NULL)

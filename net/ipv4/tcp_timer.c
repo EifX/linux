@@ -20,6 +20,7 @@
 
 #include <linux/module.h>
 #include <linux/gfp.h>
+#include <net/mptcp.h>
 #include <net/tcp.h>
 
 int sysctl_tcp_thin_linear_timeouts __read_mostly;
@@ -31,7 +32,7 @@ int sysctl_tcp_thin_linear_timeouts __read_mostly;
  *  Returns: Nothing (void)
  */
 
-static void tcp_write_err(struct sock *sk)
+void tcp_write_err(struct sock *sk)
 {
 	sk->sk_err = sk->sk_err_soft ? : ETIMEDOUT;
 	sk->sk_error_report(sk);
@@ -148,7 +149,7 @@ static void tcp_mtu_probing(struct inet_connection_sock *icsk, struct sock *sk)
  * syn_set flag is set.
  *
  */
-static bool retransmits_timed_out(struct sock *sk,
+bool retransmits_timed_out(struct sock *sk,
 				  unsigned int boundary,
 				  unsigned int timeout,
 				  bool syn_set)
@@ -176,7 +177,7 @@ static bool retransmits_timed_out(struct sock *sk,
 }
 
 /* A write timeout has occurred. Process the after effects. */
-static int tcp_write_timeout(struct sock *sk)
+int tcp_write_timeout(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -197,6 +198,15 @@ static int tcp_write_timeout(struct sock *sk)
 		}
 		retry_until = icsk->icsk_syn_retries ? : net->ipv4.sysctl_tcp_syn_retries;
 		syn_set = true;
+#ifdef CONFIG_MPTCP
+		/* Stop retransmitting MP_CAPABLE options in SYN if timed out. */
+		if (tcp_sk(sk)->request_mptcp &&
+		    icsk->icsk_retransmits >= sysctl_mptcp_syn_retries) {
+			tcp_sk(sk)->request_mptcp = 0;
+
+			MPTCP_INC_STATS_BH(sock_net(sk), MPTCP_MIB_MPCAPABLERETRANSFALLBACK);
+		}
+#endif /* CONFIG_MPTCP */
 	} else {
 		if (retransmits_timed_out(sk, net->ipv4.sysctl_tcp_retries1, 0, 0)) {
 			/* Some middle-boxes may black-hole Fast Open _after_
@@ -302,18 +312,22 @@ out:
 static void tcp_delack_timer(unsigned long data)
 {
 	struct sock *sk = (struct sock *)data;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct sock *meta_sk = mptcp(tp) ? mptcp_meta_sk(sk) : sk;
 
-	bh_lock_sock(sk);
-	if (!sock_owned_by_user(sk)) {
+	bh_lock_sock(meta_sk);
+	if (!sock_owned_by_user(meta_sk)) {
 		tcp_delack_timer_handler(sk);
 	} else {
 		inet_csk(sk)->icsk_ack.blocked = 1;
-		__NET_INC_STATS(sock_net(sk), LINUX_MIB_DELAYEDACKLOCKED);
+		__NET_INC_STATS(sock_net(meta_sk), LINUX_MIB_DELAYEDACKLOCKED);
 		/* deleguate our work to tcp_release_cb() */
 		if (!test_and_set_bit(TCP_DELACK_TIMER_DEFERRED, &sk->sk_tsq_flags))
 			sock_hold(sk);
+		if (mptcp(tp))
+			mptcp_tsq_flags(sk);
 	}
-	bh_unlock_sock(sk);
+	bh_unlock_sock(meta_sk);
 	sock_put(sk);
 }
 
@@ -587,16 +601,19 @@ out:
 static void tcp_write_timer(unsigned long data)
 {
 	struct sock *sk = (struct sock *)data;
+	struct sock *meta_sk = mptcp(tcp_sk(sk)) ? mptcp_meta_sk(sk) : sk;
 
-	bh_lock_sock(sk);
-	if (!sock_owned_by_user(sk)) {
+	bh_lock_sock(meta_sk);
+	if (!sock_owned_by_user(meta_sk)) {
 		tcp_write_timer_handler(sk);
 	} else {
 		/* delegate our work to tcp_release_cb() */
 		if (!test_and_set_bit(TCP_WRITE_TIMER_DEFERRED, &sk->sk_tsq_flags))
 			sock_hold(sk);
+		if (mptcp(tcp_sk(sk)))
+			mptcp_tsq_flags(sk);
 	}
-	bh_unlock_sock(sk);
+	bh_unlock_sock(meta_sk);
 	sock_put(sk);
 }
 
@@ -626,11 +643,12 @@ static void tcp_keepalive_timer (unsigned long data)
 	struct sock *sk = (struct sock *) data;
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
+	struct sock *meta_sk = mptcp(tp) ? mptcp_meta_sk(sk) : sk;
 	u32 elapsed;
 
 	/* Only process if socket is not in use. */
-	bh_lock_sock(sk);
-	if (sock_owned_by_user(sk)) {
+	bh_lock_sock(meta_sk);
+	if (sock_owned_by_user(meta_sk)) {
 		/* Try again later. */
 		inet_csk_reset_keepalive_timer (sk, HZ/20);
 		goto out;
@@ -702,7 +720,7 @@ death:
 	tcp_done(sk);
 
 out:
-	bh_unlock_sock(sk);
+	bh_unlock_sock(meta_sk);
 	sock_put(sk);
 }
 
